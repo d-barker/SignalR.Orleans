@@ -49,9 +49,23 @@ internal sealed class ClientGrain : IGrainBase, IClientGrain
         if (_serverId != default)
         {
             // We will listen to this stream to know if the server is disconnected (silo goes down) so that we can enact client disconnected procedure.
-            var serverDisconnectedStream = _streamProvider.GetServerDisconnectionStream(_clientState.State.ServerId);
-            var _serverDisconnectedSubscription = (await serverDisconnectedStream.GetAllSubscriptionHandles())[0];
-            await _serverDisconnectedSubscription.ResumeAsync((serverId, _) => OnDisconnect("server-disconnected"));
+            _serverDisconnectedSubscription = await GetSubscriptionHandleAsync(_serverId);
+            if (_serverDisconnectedSubscription is not null)
+            {
+                // ResumeAsync invalidates the handle it is called on and returns a NEW live handle.
+                // We must hold onto the returned handle — keeping the original (now-invalidated) one
+                // makes the next OnDisconnect throw "Handle is no longer valid" at UnsubscribeAsync.
+                _serverDisconnectedSubscription = await _serverDisconnectedSubscription.ResumeAsync((serverId, _) => OnDisconnect("server-disconnected"));
+            }
+            else
+            {
+                _logger.LogWarning(
+                    "No subscription handle found for server '{ServerId}' on {HubName} for connection '{ConnectionId}' during activation; re-subscribing to the server-disconnect stream.",
+                    _serverId, _hubName, _connectionId);
+
+                var serverDisconnectedStream = _streamProvider.GetServerDisconnectionStream(_serverId);
+                _serverDisconnectedSubscription = await serverDisconnectedStream.SubscribeAsync(_ => OnDisconnect("server-disconnected"));
+            }
         }
     }
 
@@ -111,4 +125,11 @@ internal sealed class ClientGrain : IGrainBase, IClientGrain
     }
 
     public Task SendOneWay(InvocationMessage message) => Send(message);
+
+    private async Task<StreamSubscriptionHandle<Guid>?> GetSubscriptionHandleAsync(Guid serverId)
+    {
+        var stream = _streamProvider.GetServerDisconnectionStream(serverId);
+        var handles = await stream.GetAllSubscriptionHandles();
+        return handles.FirstOrDefault();
+    }
 }

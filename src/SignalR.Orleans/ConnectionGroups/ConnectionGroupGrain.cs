@@ -37,9 +37,20 @@ internal sealed class ConnectionGroupGrain : IConnectionGroupGrain, IGrainBase
 
         var resumeSubscriptionTasks = _state.State.ConnectionIds.Select(async connectionId =>
         {
-            var clientDisconnectStream = _streamProvider.GetClientDisconnectionStream(connectionId);
-            var subscriptionHandle = (await clientDisconnectStream.GetAllSubscriptionHandles())[0];
-            await subscriptionHandle.ResumeAsync((connectionId, _) => Remove(connectionId));
+            var subscriptionHandle = await GetSubscriptionHandleAsync(connectionId);
+            if (subscriptionHandle is not null)
+            {
+                await subscriptionHandle.ResumeAsync((connectionId, _) => Remove(connectionId));
+            }
+            else
+            {
+                _logger.LogWarning(
+                    "No subscription handle found for connection '{ConnectionId}' on {GroupType} group '{GroupId}' during activation; re-subscribing to the client-disconnect stream.",
+                    connectionId, _key.GroupType, _key.GroupId);
+
+                var clientDisconnectStream = _streamProvider.GetClientDisconnectionStream(connectionId);
+                await clientDisconnectStream.SubscribeAsync((connectionId, _) => Remove(connectionId));
+            }
         });
 
         return Task.WhenAll(resumeSubscriptionTasks);
@@ -59,9 +70,11 @@ internal sealed class ConnectionGroupGrain : IConnectionGroupGrain, IGrainBase
     {
         if (_state.State.ConnectionIds.Remove(connectionId))
         {
-            var stream = _streamProvider.GetClientDisconnectionStream(connectionId);
-            var handle = (await stream.GetAllSubscriptionHandles())[0];
-            await handle.UnsubscribeAsync();
+            var handle = await GetSubscriptionHandleAsync(connectionId);
+            if (handle is not null)
+            {
+                await handle.UnsubscribeAsync();
+            }
 
             if (_state.State.ConnectionIds.Count == 0)
             {
@@ -88,6 +101,15 @@ internal sealed class ConnectionGroupGrain : IConnectionGroupGrain, IGrainBase
         return SendAll(message, _state.State.ConnectionIds.Except(excludedConnectionIds));
     }
 
+    public Task SendOneWay(InvocationMessage message) => Send(message);
+
+    private async Task<StreamSubscriptionHandle<string>?> GetSubscriptionHandleAsync(string connectionId)
+    {
+        var stream = _streamProvider.GetClientDisconnectionStream(connectionId);
+        var handles = await stream.GetAllSubscriptionHandles();
+        return handles.FirstOrDefault();
+    }
+
     private Task SendAll([Immutable] InvocationMessage message, IEnumerable<string> connectionIds)
     {
         _logger.LogDebug("Sending message to {HubName}.{MethodName} on {GroupType} group '{GroupId}'.",
@@ -95,6 +117,4 @@ internal sealed class ConnectionGroupGrain : IConnectionGroupGrain, IGrainBase
 
         return Task.WhenAll(connectionIds.Select(connectionId => _grainFactory.GetClientGrain(_key.HubType, connectionId).Send(message)));
     }
-
-    public Task SendOneWay(InvocationMessage message) => Send(message);
 }
