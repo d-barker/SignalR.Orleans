@@ -22,9 +22,29 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
     private IAsyncStream<AllMessage> _allStream = default!;
     private Timer _timer = default!;
 
+    // Self-heal. An Orleans *client* stream subscription does not survive a full cluster recycle — e.g.
+    // scaling the silo from 1 -> N restarts every silo, so the client connection drops and reconnects to
+    // a brand-new cluster generation. The subscription's in-memory observer is orphaned and nothing
+    // re-establishes it, so this hub server silently stops receiving SERVER_STREAM / ALL_STREAM messages
+    // until the process restarts. (Producer-side grains recover automatically because they rehydrate
+    // their state from storage on reactivation.)
+    //
+    // Primary recovery is event-driven: an OrleansSignalRConnectionMonitor (an IClientConnectionRetryFilter)
+    // raises ConnectionLost the instant the client can't reach the cluster, flipping us to "disconnected"
+    // and starting a single-flight recovery loop (RecoverAsync) that re-subscribes as soon as the cluster
+    // is reachable again. A low-frequency fallback probe heals the cases where no monitor is registered
+    // (e.g. on a silo) or a signal was missed.
+    private static readonly TimeSpan RecoveryProbeInterval = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan FallbackProbeInterval = TimeSpan.FromSeconds(60);
+    private readonly OrleansSignalRConnectionMonitor? _connectionMonitor;
+    private Timer _fallbackTimer = default!;
+    private volatile bool _connected = true;
+    private int _recovering;
+
     public OrleansHubLifetimeManager(
         ILogger<OrleansHubLifetimeManager<THub>> logger,
-        IClusterClient clusterClient
+        IClusterClient clusterClient,
+        OrleansSignalRConnectionMonitor? connectionMonitor = null
     )
     {
         var hubType = typeof(THub).BaseType?.GenericTypeArguments.FirstOrDefault() ?? typeof(THub);
@@ -34,6 +54,7 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
         _serverId = Guid.NewGuid();
         _logger = logger;
         _clusterClient = clusterClient;
+        _connectionMonitor = connectionMonitor;
     }
 
     private Task HeartbeatCheck()
@@ -63,14 +84,176 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
                 _ => Task.Run(HeartbeatCheck), null, TimeSpan.FromSeconds(0),
                 TimeSpan.FromMinutes(SignalROrleansConstants.SERVER_HEARTBEAT_PULSE_IN_MINUTES));
 
-            await Task.WhenAll(
-                _allStream.SubscribeAsync((msg, _) => ProcessAllMessage(msg)),
-                _serverStream.SubscribeAsync((msg, _) => ProcessServerMessage(msg))
-            );
+            await SubscribeStreamsAsync();
+
+            // Primary, event-driven recovery: the monitor raises ConnectionLost the instant the Orleans
+            // client loses the cluster, which starts a single-flight recovery loop. No steady-state polling.
+            if (_connectionMonitor is not null)
+            {
+                _connectionMonitor.ConnectionLost += OnConnectionLost;
+            }
+
+            // Fallback safety net: a low-frequency read-only probe that heals even when no monitor is
+            // registered (e.g. on a silo) or a ConnectionLost signal was missed.
+            _fallbackTimer = new Timer(
+                _ => Task.Run(FallbackProbeAsync), null, FallbackProbeInterval, FallbackProbeInterval);
 
             _logger.LogInformation(
                 "Initialized complete: Orleans HubLifetimeManager {hubName} (serverId: {serverId})",
                 _hubName, _serverId);
+        }
+        finally
+        {
+            _streamSetupLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// (Re)subscribes the server and broadcast streams. Resumes the existing subscription when one is
+    /// already recorded in PubSub (re-wiring the live observer) rather than stacking a duplicate, so it
+    /// is safe to call both for the initial setup and for re-establishing delivery after a reconnect.
+    /// </summary>
+    private async Task SubscribeStreamsAsync()
+    {
+        await ResumeOrSubscribeAsync(_serverStream, (msg, _) => ProcessServerMessage(msg));
+        await ResumeOrSubscribeAsync(_allStream, (msg, _) => ProcessAllMessage(msg));
+    }
+
+    private static async Task ResumeOrSubscribeAsync<T>(IAsyncStream<T> stream, Func<T, StreamSequenceToken, Task> onNext)
+    {
+        var handles = await stream.GetAllSubscriptionHandles();
+        if (handles.Count > 0)
+        {
+            // Re-attach the observer to the existing subscription; drop any duplicates so repeated
+            // reconnects can't accumulate subscriptions.
+            await handles[0].ResumeAsync(onNext);
+            for (var i = 1; i < handles.Count; i++)
+            {
+                await handles[i].UnsubscribeAsync();
+            }
+        }
+        else
+        {
+            await stream.SubscribeAsync(onNext);
+        }
+    }
+
+    /// <summary>
+    /// <see cref="OrleansSignalRConnectionMonitor.ConnectionLost"/> handler. Marks the backplane as
+    /// disconnected and kicks the single-flight recovery loop. Runs on the Orleans client's reconnect
+    /// path, so it must be cheap and non-blocking.
+    /// </summary>
+    private void OnConnectionLost()
+    {
+        _connected = false;
+        _ = Task.Run(RecoverAsync);
+    }
+
+    /// <summary>
+    /// Fallback safety net invoked on a low-frequency timer. Detects a dropped connection with a
+    /// read-only probe and triggers recovery. Covers the cases where no
+    /// <see cref="OrleansSignalRConnectionMonitor"/> is registered (e.g. on a silo) or a ConnectionLost
+    /// signal was missed. A no-op while the connection is healthy beyond a single cheap probe.
+    /// </summary>
+    private async Task FallbackProbeAsync()
+    {
+        if (_streamProvider is null)
+        {
+            return;
+        }
+
+        if (_connected)
+        {
+            try
+            {
+                // Read-only probe (no storage write, unlike the ServerDirectory heartbeat).
+                await _serverStream.GetAllSubscriptionHandles();
+                return;
+            }
+            catch
+            {
+                _connected = false;
+            }
+        }
+
+        await RecoverAsync();
+    }
+
+    /// <summary>
+    /// Single-flight recovery loop. Waits (polling a read-only probe) until the cluster is reachable, then
+    /// re-establishes the stream subscriptions so message delivery resumes without a process restart.
+    /// Coalesces the many ConnectionLost signals that arrive during an outage into one running loop, and
+    /// re-arms itself if a fresh loss lands while it is finishing.
+    /// </summary>
+    private async Task RecoverAsync()
+    {
+        if (_streamProvider is null || _connected)
+        {
+            return;
+        }
+
+        if (Interlocked.Exchange(ref _recovering, 1) == 1)
+        {
+            return;
+        }
+
+        try
+        {
+            _logger.LogWarning(
+                "Backplane connection lost for {hubName} (serverId: {serverId}); waiting for the cluster and re-subscribing.",
+                _hubName, _serverId);
+
+            while (!_connected)
+            {
+                try
+                {
+                    // Read-only probe: throws while the client is disconnected, succeeds once the cluster
+                    // is reachable again.
+                    await _serverStream.GetAllSubscriptionHandles();
+                }
+                catch
+                {
+                    await Task.Delay(RecoveryProbeInterval);
+                    continue;
+                }
+
+                await ResubscribeAsync();
+                _connected = true;
+                _connectionMonitor?.NotifyReconnected();
+
+                _logger.LogInformation(
+                    "Backplane subscriptions re-established for {hubName} (serverId: {serverId}).",
+                    _hubName, _serverId);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "Backplane recovery failed for {hubName} (serverId: {serverId}); will retry on the next signal or probe.",
+                _hubName, _serverId);
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _recovering, 0);
+        }
+
+        // A loss that arrived while recovery was running (and was coalesced away by the guard) is picked
+        // up here so we don't wait for the next fallback probe.
+        if (!_connected)
+        {
+            _ = Task.Run(RecoverAsync);
+        }
+    }
+
+    private async Task ResubscribeAsync()
+    {
+        await _streamSetupLock.WaitAsync();
+        try
+        {
+            await SubscribeStreamsAsync();
+
+            // Re-assert this server's liveness in the directory after the outage (one cheap write).
+            await HeartbeatCheck();
         }
         finally
         {
@@ -255,6 +438,12 @@ public sealed class OrleansHubLifetimeManager<THub> : HubLifetimeManager<THub>, 
     public void Dispose()
     {
         _timer?.Dispose();
+        _fallbackTimer?.Dispose();
+
+        if (_connectionMonitor is not null)
+        {
+            _connectionMonitor.ConnectionLost -= OnConnectionLost;
+        }
 
         var toUnsubscribe = new List<Task>();
         if (_serverStream is not null)
