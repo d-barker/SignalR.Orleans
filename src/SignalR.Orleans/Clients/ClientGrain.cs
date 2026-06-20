@@ -69,13 +69,33 @@ internal sealed class ClientGrain : IGrainBase, IClientGrain
         _logger.LogDebug("Disconnecting connection on {hubName} for connection {connectionId} from server {serverId} via reason '{reason}'.",
             _hubName, _connectionId, _clientState.State.ServerId, reason);
 
-        if (_serverDisconnectedSubscription is not null)
+        // Null the field before awaiting so an interleaved call (Send is [ReadOnly]) can't observe
+        // the same handle and attempt to unsubscribe it a second time.
+        var subscription = _serverDisconnectedSubscription;
+        _serverDisconnectedSubscription = null;
+        if (subscription is not null)
         {
-            await _serverDisconnectedSubscription.UnsubscribeAsync();
-            _serverDisconnectedSubscription = null;
+            // Defensive: the handle may already be invalid (e.g. the producer-side subscription was
+            // torn down), which surfaces as "Handle is no longer valid. It has been used to
+            // unsubscribe or resume." Swallow it so disconnect cleanup still completes.
+            try
+            {
+                await subscription.UnsubscribeAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Error while unsubscribing from the server-disconnected stream for connection {connectionId}.", _connectionId);
+            }
         }
 
-        await _streamProvider.GetClientDisconnectionStream(_connectionId).OnNextAsync(_connectionId);
+        try
+        {
+            await _streamProvider.GetClientDisconnectionStream(_connectionId).OnNextAsync(_connectionId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error while publishing to the client-disconnection stream for connection {connectionId}.", _connectionId);
+        }
 
         await _clientState.ClearStateAsync();
 
